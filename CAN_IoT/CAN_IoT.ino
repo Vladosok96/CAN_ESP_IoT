@@ -1,15 +1,13 @@
-/*
-  Rui Santos
-  Complete project details at https://RandomNerdTutorials.com/esp32-sim800l-publish-data-to-cloud/
-  
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files.
-  
-  The above copyright notice and this permission notice shall be included in all
-  copies or substantial portions of the Software.
-*/
 
-// Your GPRS credentials (leave empty, if not needed)
+#include "esp32_can.h"            // https://github.com/collin80/esp32_can AND https://github.com/collin80/can_common
+
+#define CANPID_RPM          0x0C
+#define CANPID_SPEED        0x0D
+#define CANPID_TEMPERATURE  0x05
+#define CAN_REQST_ID        0x7DF 
+#define CAN_REPLY_ID        0x7E8
+
+// GPRS credentials (leave empty, if not needed)
 const char apn[]      = "internet.beeline.ru"; // APN (example: internet.vodafone.pt) use https://wiki.apnchanger.org
 const char gprsUser[] = "beeline"; // GPRS User
 const char gprsPass[] = "beeline"; // GPRS Password
@@ -87,9 +85,10 @@ uint32_t lastReconnectAttempt = 0;
 #define IP5306_ADDR          0x75
 #define IP5306_REG_SYS_CTL0  0x00
 
-float engine_temperature = 0;
-float rpm = 0;
-float car_speed = 0;
+uint16_t rpm;
+uint16_t speed;
+uint16_t temperature;
+int message_state = 0;
 long lastMsg = 0;
 
 bool setPowerBoostKeepOn(int en){
@@ -169,6 +168,11 @@ void setup() {
   // Set serial monitor debugging window baud rate to 115200
   SerialMon.begin(115200);
 
+  // Start CAN0 (built-in can module)
+  CAN0.begin();
+  CAN0.watchFor(CAN_REPLY_ID);
+  CAN0.setCallback(0, callback);
+
   // Start I2C communication
   I2CPower.begin(I2C_SDA, I2C_SCL, 400000);
 
@@ -225,6 +229,71 @@ void setup() {
 
 }
 
+void request_RPM(void) {  
+  CAN_FRAME outgoing;
+  outgoing.id = CAN_REQST_ID;
+  outgoing.length = 8;
+  outgoing.extended = 0;
+  outgoing.rtr = 0;
+  outgoing.data.uint8[0] = 0x02;  
+  outgoing.data.uint8[1] = 0x01;  
+  outgoing.data.uint8[2] = CANPID_RPM; 
+  outgoing.data.uint8[3] = 0x00;
+  outgoing.data.uint8[4] = 0x00;  
+  outgoing.data.uint8[5] = 0x00;  
+  outgoing.data.uint8[6] = 0x00;  
+  outgoing.data.uint8[7] = 0x00;  
+  CAN0.sendFrame(outgoing);
+}
+
+void request_speed(void) {  
+  CAN_FRAME outgoing;
+  outgoing.id = CAN_REQST_ID;
+  outgoing.length = 8;
+  outgoing.extended = 0;
+  outgoing.rtr = 0;
+  outgoing.data.uint8[0] = 0x02;  
+  outgoing.data.uint8[1] = 0x01;  
+  outgoing.data.uint8[2] = CANPID_SPEED; 
+  outgoing.data.uint8[3] = 0x00;
+  outgoing.data.uint8[4] = 0x00;  
+  outgoing.data.uint8[5] = 0x00;  
+  outgoing.data.uint8[6] = 0x00;  
+  outgoing.data.uint8[7] = 0x00;  
+  CAN0.sendFrame(outgoing);
+}
+
+void request_temperature(void) {  
+  CAN_FRAME outgoing;
+  outgoing.id = CAN_REQST_ID;
+  outgoing.length = 8;
+  outgoing.extended = 0;
+  outgoing.rtr = 0;
+  outgoing.data.uint8[0] = 0x02;  
+  outgoing.data.uint8[1] = 0x01;  
+  outgoing.data.uint8[2] = CANPID_TEMPERATURE; 
+  outgoing.data.uint8[3] = 0x00;
+  outgoing.data.uint8[4] = 0x00;  
+  outgoing.data.uint8[5] = 0x00;  
+  outgoing.data.uint8[6] = 0x00;  
+  outgoing.data.uint8[7] = 0x00;  
+  CAN0.sendFrame(outgoing);
+}
+
+void callback(CAN_FRAME *from_car) {
+  if (from_car->data.uint8[2]==CANPID_RPM) {
+    uint8_t rpmOBDH = from_car->data.uint8[3];
+    uint8_t rpmOBDL = from_car->data.uint8[4];
+    rpm = (uint16_t) ((256*rpmOBDH) + rpmOBDL)/(float)4;
+  }
+  else if (from_car->data.uint8[2]==CANPID_SPEED) {
+    speed = from_car->data.uint8[3];
+  }
+  else if (from_car->data.uint8[2]==CANPID_TEMPERATURE) {
+    temperature = from_car->data.uint8[3] - 40;
+  }
+}
+
 void loop() {
   if (!mqtt.connected()) {
     SerialMon.println("=== MQTT NOT CONNECTED ===");
@@ -241,21 +310,41 @@ void loop() {
   }
    
   long now = millis();
-  if (now - lastMsg > 30000) {
-    lastMsg = now;
-    
-    // Temperature in Celsius
-    engine_temperature = random(-30, 130);   
-    // Uncomment the next line to set temperature in Fahrenheit 
-    // (and comment the previous temperature line)
-    //temperature = 1.8 * bme.readTemperature() + 32; // Temperature in Fahrenheit
+  if (now - lastMsg > 15000 && message_state == 0) {
+    request_temperature(); 
     
     // Convert the value to a char array
-    char tempString[8];
-    dtostrf(engine_temperature, 1, 2, tempString);
+    char tmpString[8];
+    dtostrf(temperature, 1, 2, tmpString);
     Serial.print("Temperature: ");
-    Serial.println(tempString);
-    mqtt.publish(topicTemperature, tempString);
+    Serial.println(tmpString);
+    mqtt.publish(topicTemperature, tmpString);
+
+    message_state = 1;
+  }
+  else if (now - lastMsg > 16000 && message_state == 1) {
+    request_speed();
+
+    // Convert the value to a char array
+    char tmpString[8];
+    dtostrf(temperature, 1, 2, tmpString);
+    Serial.print("speed: ");
+    Serial.println(tmpString);
+    mqtt.publish(topicSpeed, tmpString);
+    message_state = 2;
+  }
+  else if (now - lastMsg > 17000 && message_state == 2) {
+    lastMsg = now;
+    
+    request_RPM();
+
+    // Convert the value to a char array
+    char tmpString[8];
+    dtostrf(temperature, 1, 2, tmpString);
+    Serial.print("rpm: ");
+    Serial.println(tmpString);
+    mqtt.publish(topicRPM, tmpString);
+    message_state = 0;
   }
 
   mqtt.loop();
